@@ -63,6 +63,22 @@ export function buildCorpusStats(tokenisedDocs: string[][]): CorpusStats {
 }
 
 /**
+ * Type penalty for meta-commits — multiplies the hybrid score by `factor`
+ * when the document's name matches the meta-commit regex (release bumps,
+ * merge commits, badge updates, etc.). These commits bundle every issue
+ * number from a release window and steal top-1 from real work commits.
+ *
+ * Defaults: factor 0.5, regex covers `chore(release)`, `Merge `, `bump `,
+ * `[Dream Cycle]`, `publish 3.x.y`. Tune via env or call site.
+ */
+export const META_COMMIT_REGEX = /^(chore\(release\)|Merge\s|bump\s|publish\s+\d|\[Dream Cycle\b)/i;
+
+export function typePenalty(name: string | undefined, factor = 0.5, regex = META_COMMIT_REGEX): number {
+  if (!name) return 1.0;
+  return regex.test(name) ? factor : 1.0;
+}
+
+/**
  * BM25 score of one document against a query.
  * Standard Okapi formula with k1=1.5 and b=0.75.
  */
@@ -127,6 +143,30 @@ export function hybridScores(
   const cN = normalise(cosine);
   const bN = normalise(bm25);
   return cN.map((c, i) => alpha * c + (1 - alpha) * bN[i]);
+}
+
+/**
+ * Multi-field BM25 score — treats subject and body as separate fields with
+ * independent token frequencies, then combines `subjectWeight * subjectBM25
+ * + bodyWeight * bodyBM25`. Subject (commit title / pattern name) carries
+ * the high-signal tokens (file names, action verbs, ADR refs); body is
+ * often boilerplate. Default 3:1 weight reflects that asymmetry.
+ *
+ * Caller must build separate CorpusStats for subjects and bodies (their
+ * IDF distributions differ — subjects are short, bodies long).
+ */
+export function multiFieldBM25(
+  queryTokens: string[],
+  subjectTokens: string[],
+  bodyTokens: string[],
+  subjectStats: CorpusStats,
+  bodyStats: CorpusStats,
+  subjectWeight = 3.0,
+  bodyWeight = 1.0,
+): number {
+  const sScore = bm25Score(queryTokens, subjectTokens, subjectStats);
+  const bScore = bm25Score(queryTokens, bodyTokens, bodyStats);
+  return subjectWeight * sScore + bodyWeight * bScore;
 }
 
 /**

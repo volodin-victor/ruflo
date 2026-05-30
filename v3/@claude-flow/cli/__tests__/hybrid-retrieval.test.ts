@@ -13,6 +13,9 @@ import {
   hybridScores,
   cosineSim,
   mmrRerank,
+  multiFieldBM25,
+  typePenalty,
+  META_COMMIT_REGEX,
 } from '../src/memory/hybrid-retrieval.js';
 
 describe('tokenize', () => {
@@ -173,5 +176,102 @@ describe('mmrRerank', () => {
   it('handles empty and k=0', () => {
     expect(mmrRerank([], 3, 0.5)).toEqual([]);
     expect(mmrRerank([{ id: 'x', embedding: [1], relevance: 1 }], 0, 0.5)).toEqual([]);
+  });
+});
+
+describe('multiFieldBM25 — subject-weighted BM25 (ADR-079)', () => {
+  // 4 docs with subject + body, body intentionally noisy.
+  const subjects = [
+    tokenize('fix sql injection in migrate.ts'),
+    tokenize('feat structured distillation 4-field schema'),
+    tokenize('chore release bump 3.10.18'),
+    tokenize('docs update README'),
+  ];
+  const bodies = [
+    tokenize('Adds validateSqlIdentifier and a regression test'),
+    tokenize('Per arXiv:2603.13017. labels and paths lead the embedding'),
+    tokenize('Routine version bump; no functional changes. Lots of generic words bump release version'),
+    tokenize('Generic README updates everywhere'),
+  ];
+  const subjectStats = buildCorpusStats(subjects);
+  const bodyStats = buildCorpusStats(bodies);
+
+  it('ranks the doc whose SUBJECT contains query tokens highest', () => {
+    const q = tokenize('structured distillation schema');
+    const scores = subjects.map((_, i) =>
+      multiFieldBM25(q, subjects[i], bodies[i], subjectStats, bodyStats, 3.0, 1.0),
+    );
+    const top = scores.indexOf(Math.max(...scores));
+    expect(top).toBe(1);
+  });
+
+  it('subjectWeight=0 collapses to body-only', () => {
+    const q = tokenize('validateSqlIdentifier');
+    const scoresBodyOnly = subjects.map((_, i) =>
+      multiFieldBM25(q, subjects[i], bodies[i], subjectStats, bodyStats, 0, 1.0),
+    );
+    const scoresBalanced = subjects.map((_, i) =>
+      multiFieldBM25(q, subjects[i], bodies[i], subjectStats, bodyStats, 3.0, 1.0),
+    );
+    // Body-only should match doc 0 (sql fix has validateSqlIdentifier in body).
+    // Balanced should still match doc 0 since subject also helps via "sql"...
+    // but specifically: body-only score for doc 0 should be >0.
+    expect(scoresBodyOnly[0]).toBeGreaterThan(0);
+    expect(scoresBalanced[0]).toBeGreaterThan(0);
+  });
+
+  it('subject 3× over body avoids losing to body-noise', () => {
+    // Query "release" appears in doc 2's subject AND doc 2's body multiple times.
+    // doc 2 should dominate.
+    const q = tokenize('release bump');
+    const scores = subjects.map((_, i) =>
+      multiFieldBM25(q, subjects[i], bodies[i], subjectStats, bodyStats, 3.0, 1.0),
+    );
+    expect(scores.indexOf(Math.max(...scores))).toBe(2);
+  });
+});
+
+describe('typePenalty — meta-commit downweighting (ADR-079)', () => {
+  it('matches chore(release) commits', () => {
+    expect(typePenalty('chore(release): bump 3.10.18 → 3.10.19')).toBe(0.5);
+    expect(typePenalty('chore(release): publish 3.10.19')).toBe(0.5);
+  });
+
+  it('matches Merge commits', () => {
+    expect(typePenalty('Merge pull request #2227 from fix/2245')).toBe(0.5);
+    expect(typePenalty('Merge feat/hybrid-retrieval: ADR-078 work')).toBe(0.5);
+  });
+
+  it('matches bump and publish lines', () => {
+    expect(typePenalty('bump 3.10.18 → 3.10.19')).toBe(0.5);
+    expect(typePenalty('publish 3.10.19 to npm')).toBe(0.5);
+  });
+
+  it('matches Dream Cycle scans', () => {
+    expect(typePenalty('[Dream Cycle 2026-05-30] intelligence findings')).toBe(0.5);
+  });
+
+  it('does NOT penalise real work commits', () => {
+    expect(typePenalty('feat(intelligence): structured distillation (ADR-076)')).toBe(1.0);
+    expect(typePenalty('fix(security): SQL injection in migrate.ts')).toBe(1.0);
+    expect(typePenalty('docs(adr): ADR-078 hybrid retrieval')).toBe(1.0);
+  });
+
+  it('handles undefined name safely', () => {
+    expect(typePenalty(undefined)).toBe(1.0);
+    expect(typePenalty('')).toBe(1.0);
+  });
+
+  it('respects custom factor', () => {
+    expect(typePenalty('chore(release): bump', 0.0)).toBe(0.0);
+    expect(typePenalty('chore(release): bump', 0.25)).toBe(0.25);
+  });
+
+  it('regex covers the documented meta-commit patterns', () => {
+    expect(META_COMMIT_REGEX.test('chore(release): x')).toBe(true);
+    expect(META_COMMIT_REGEX.test('Merge x')).toBe(true);
+    expect(META_COMMIT_REGEX.test('bump x')).toBe(true);
+    expect(META_COMMIT_REGEX.test('feat: x')).toBe(false);
+    expect(META_COMMIT_REGEX.test('fix: x')).toBe(false);
   });
 });

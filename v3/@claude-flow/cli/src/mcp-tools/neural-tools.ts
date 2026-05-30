@@ -496,6 +496,9 @@ export const neuralTools: MCPTool[] = [
         mode: { type: 'string', enum: ['hybrid', 'cosine'], description: 'Search mode — hybrid (cosine+BM25+MMR, default) or cosine (pre-3.10.18 behaviour, for A/B)' },
         alpha: { type: 'number', description: 'Hybrid: cosine weight in [0,1]; (1-α) is BM25 weight (default 0.6)' },
         mmrLambda: { type: 'number', description: 'Hybrid: MMR balance — 1.0 = pure relevance, 0.0 = pure diversity (default 0.5)' },
+        subjectWeight: { type: 'number', description: 'Hybrid: multi-field BM25 weight for subject/name (default 3.0)' },
+        bodyWeight: { type: 'number', description: 'Hybrid: multi-field BM25 weight for body/content (default 1.0)' },
+        typePenaltyFactor: { type: 'number', description: 'Hybrid: meta-commit score multiplier — release/merge/bump commits × this factor (default 1.0 = disabled; set 0.5 for aggressive suppression)' },
         data: { type: 'object', description: 'Pattern data' },
       },
     },
@@ -578,7 +581,7 @@ export const neuralTools: MCPTool[] = [
         const alpha = Number(input.alpha ?? 0.6);    // cosine weight; (1-α) is BM25
         const mmrLambda = Number(input.mmrLambda ?? 0.5); // 1 = pure relevance, 0 = pure diversity
 
-        const { tokenize, buildCorpusStats, bm25Score, hybridScores, mmrRerank } =
+        const { tokenize, buildCorpusStats, hybridScores, mmrRerank, multiFieldBM25, typePenalty } =
           await import('../memory/hybrid-retrieval.js');
 
         const queryEmbedding = await generateEmbedding(query, 384);
@@ -604,13 +607,35 @@ export const neuralTools: MCPTool[] = [
           };
         }
 
-        // Hybrid path — BM25 over the pattern's content (falls back to name
-        // for pre-3.10.18 patterns missing the field).
-        const docs = patterns.map((p) => tokenize(p.content ?? p.name));
-        const stats = buildCorpusStats(docs);
+        // Hybrid path — multi-field BM25 (subject 3×, body 1×) + type penalty
+        // for meta-commits (release bumps / merges) per ADR-079. Falls back
+        // to single-field BM25 when no content is stored.
+        const subjectDocs = patterns.map((p) => tokenize(p.name ?? ''));
+        const bodyDocs = patterns.map((p) => {
+          // Body is content minus the subject — if content starts with name,
+          // strip it; otherwise use full content (with name removed if duplicated).
+          const c = p.content ?? '';
+          const n = p.name ?? '';
+          return tokenize(c.startsWith(n) ? c.slice(n.length) : c);
+        });
+        const subjectStats = buildCorpusStats(subjectDocs);
+        const bodyStats = buildCorpusStats(bodyDocs);
         const queryTokens = tokenize(query);
-        const bm25Arr = docs.map((d) => bm25Score(queryTokens, d, stats));
-        const hybridArr = hybridScores(cosineArr, bm25Arr, alpha);
+        const subjectWeight = Number(input.subjectWeight ?? 3.0);
+        const bodyWeight = Number(input.bodyWeight ?? 1.0);
+        const bm25Arr = patterns.map((_, i) =>
+          multiFieldBM25(queryTokens, subjectDocs[i], bodyDocs[i], subjectStats, bodyStats, subjectWeight, bodyWeight),
+        );
+        const baseHybrid = hybridScores(cosineArr, bm25Arr, alpha);
+        // Type penalty — opt-in (default 1.0 = disabled). Ablation in ADR-079
+        // showed multi-field BM25 alone gives best top-1 (8/10 vs 7/10 with
+        // penalty enabled) because some relevant work commits also match the
+        // Merge/release regex. Callers wanting aggressive meta-commit
+        // suppression can set {typePenaltyFactor: 0.5}.
+        const typeFactor = Number(input.typePenaltyFactor ?? 1.0);
+        const hybridArr = typeFactor === 1.0
+          ? baseHybrid
+          : baseHybrid.map((s, i) => s * typePenalty(patterns[i].name, typeFactor));
 
         // MMR diversity over top-K*3 hybrid candidates → top-K final.
         const prelim = patterns
