@@ -2429,7 +2429,7 @@ jobs:
           test -f @claude-flow/cli/dist/src/init/statusline-generator.js \
             || { echo "::error::statusline-generator.js not built"; exit 1; }
 
-      - name: Guard 2 — smoke: generate .cjs and validate output ranges
+      - name: "Guard 2 — smoke: generate .cjs and validate output ranges"
         shell: bash
         run: node scripts/smoke-statusline-generator-delegation.mjs
 
